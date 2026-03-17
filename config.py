@@ -27,6 +27,19 @@ class Settings(BaseSettings):
     public_sender_email: str = "assinaturas@goldsign.local"
     public_sender_name: str = "Operacao GoldSign"
     public_sender_document: str = "00000000000001"
+    gold_credit_signer_email: str = "assinaturas@goldsign.local"
+    gold_credit_signer_name: str = "GOLD CREDIT SECURITIZADORA S/A"
+    gold_credit_signer_document: str = "39575046000174"
+    gold_credit_signature_page: int = 12
+    gold_credit_signature_x: float = 0.06
+    gold_credit_signature_y: float = 0.34
+    gold_credit_signature_width: float = 0.44
+    gold_credit_signature_height: float = 0.10
+    contract_mother_signature_page: int = 12
+    contract_mother_signature_x: float = 0.06
+    contract_mother_signature_y: float = 0.72
+    contract_mother_signature_width: float = 0.44
+    contract_mother_signature_height: float = 0.10
 
     # Assinatura
     signature_field_name: str = "AssinaturaICP"

@@ -188,6 +188,7 @@ def _obter_box_assinatura(
 
 def preparar_documento_pades_externo(
     pdf_bytes: bytes,
+    field_name: str,
     assinatura_pagina: int = 1,
     assinatura_x: float = 0.06,
     assinatura_y: float = 0.06,
@@ -214,7 +215,7 @@ def preparar_documento_pades_externo(
 
     writer = IncrementalPdfFileWriter(input_buf)
     sig_meta = signers.PdfSignatureMetadata(
-        field_name=settings.signature_field_name,
+        field_name=field_name,
         md_algorithm="sha256",
         reason=settings.signature_reason,
         location=settings.signature_location,
@@ -232,7 +233,7 @@ def preparar_documento_pades_externo(
         signature_meta=sig_meta,
         signer=ext_signer,
         new_field_spec=SigFieldSpec(
-            sig_field_name=settings.signature_field_name,
+            sig_field_name=field_name,
             on_page=pagina_idx,
             box=box,
         ),
