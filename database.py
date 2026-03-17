@@ -118,15 +118,33 @@ def listar_gestores_por_empresa(empresa_id: str) -> list:
     return resultado.data or []
 
 
-def criar_empresa(razao_social: str, cnpj: str, nome_fantasia: str = None) -> Optional[dict]:
+def criar_empresa(
+    razao_social: str,
+    cnpj: str | None = None,
+    nome_fantasia: str = None,
+    tipo_cadastro: str | None = None,
+    documento: str | None = None,
+) -> Optional[dict]:
     db = get_supabase()
     dados: dict = {
         "razao_social": razao_social,
-        "cnpj": "".join(c for c in cnpj if c.isdigit()),
     }
+    cnpj_digits = "".join(c for c in str(cnpj or "") if c.isdigit())
+    if cnpj_digits:
+        dados["cnpj"] = cnpj_digits
     if nome_fantasia:
         dados["nome_fantasia"] = nome_fantasia
-    resultado = db.table("empresas").insert(dados).execute()
+    if tipo_cadastro:
+        dados["tipo_cadastro"] = tipo_cadastro
+    documento_digits = "".join(c for c in str(documento or "") if c.isdigit())
+    if documento_digits:
+        dados["documento"] = documento_digits
+    try:
+        resultado = db.table("empresas").insert(dados).execute()
+    except Exception:
+        dados.pop("tipo_cadastro", None)
+        dados.pop("documento", None)
+        resultado = db.table("empresas").insert(dados).execute()
     return resultado.data[0] if resultado.data else None
 
 
@@ -153,6 +171,18 @@ def buscar_empresa_por_cnpj(cnpj: str) -> Optional[dict]:
     digits = "".join(c for c in cnpj if c.isdigit())
     resultado = db.table("empresas").select("*").eq("cnpj", digits).execute()
     return resultado.data[0] if resultado.data else None
+
+
+def buscar_empresa_por_documento(documento: str) -> Optional[dict]:
+    db = get_supabase()
+    digits = "".join(c for c in str(documento or "") if c.isdigit())
+    if not digits:
+        return None
+    try:
+        resultado = db.table("empresas").select("*").eq("documento", digits).execute()
+        return resultado.data[0] if resultado.data else None
+    except Exception:
+        return None
 
 
 def listar_clientes_gestor(empresa_id: str, excluir_usuario_id: str = None) -> list:
@@ -621,6 +651,5 @@ def gerar_url_assinada(caminho: str, expira_em_segundos: int = 3600) -> str:
         caminho, expira_em_segundos
     )
     return resultado.get("signedURL", "")
-
 
 

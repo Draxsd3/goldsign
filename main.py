@@ -125,12 +125,24 @@ def _obter_remetente_publico() -> dict:
     if remetente:
         return remetente
 
+    empresa = db.buscar_empresa_por_documento(settings.public_sender_document)
+    if not empresa:
+        empresa = db.criar_empresa(
+            razao_social=settings.public_sender_name,
+            nome_fantasia=settings.public_sender_name,
+            tipo_cadastro="empresa",
+            documento=settings.public_sender_document,
+        )
+    if not empresa:
+        raise HTTPException(status_code=500, detail="Nao foi possivel inicializar a empresa do sistema.")
+
     senha_h = hash_senha(uuid.uuid4().hex)
     remetente = db.criar_usuario(
         settings.public_sender_email,
         settings.public_sender_name,
         senha_h,
         tipo_usuario="usuario",
+        empresa_id=empresa["id"],
     )
     if not remetente:
         raise HTTPException(status_code=500, detail="Nao foi possivel inicializar o remetente do sistema.")
@@ -1635,6 +1647,5 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 
 

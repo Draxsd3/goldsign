@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     backend_url: str = "http://localhost:8000"
     public_sender_email: str = "assinaturas@goldsign.local"
     public_sender_name: str = "Operacao GoldSign"
+    public_sender_document: str = "00000000000001"
 
     # Assinatura
     signature_field_name: str = "AssinaturaICP"
