@@ -56,6 +56,26 @@ _documentos_em_preparacao: dict[str, str] = {}  # documento_id → token
 # Desafios de autenticaÃ§Ã£o por certificado: {nonce_id: {"desafio": bytes, "expira_em": float}}
 _desafios_pendentes: dict[str, dict] = {}
 
+
+def _build_cors_origins() -> list[str]:
+    origins = {
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    }
+    if settings.frontend_url:
+        origins.add(settings.frontend_url.strip())
+    if settings.frontend_urls:
+        origins.update(
+            item.strip()
+            for item in settings.frontend_urls.split(",")
+            if item.strip()
+        )
+    return sorted(origins)
+
 app = FastAPI(
     title=settings.app_name,
     description="API de assinatura digital com certificados ICP-Brasil no padrÃ£o PAdES",
@@ -64,15 +84,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.frontend_url,
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
-    ],
+    allow_origins=_build_cors_origins(),
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,6 +118,23 @@ def _usuario_response(usuario: dict) -> dict:
 
 def _clamp_float(valor: float, minimo: float, maximo: float) -> float:
     return max(minimo, min(maximo, float(valor)))
+
+
+def _obter_remetente_publico() -> dict:
+    remetente = db.buscar_usuario_por_email(settings.public_sender_email)
+    if remetente:
+        return remetente
+
+    senha_h = hash_senha(uuid.uuid4().hex)
+    remetente = db.criar_usuario(
+        settings.public_sender_email,
+        settings.public_sender_name,
+        senha_h,
+        tipo_usuario="usuario",
+    )
+    if not remetente:
+        raise HTTPException(status_code=500, detail="Nao foi possivel inicializar o remetente do sistema.")
+    return remetente
 
 
 def _validar_certificado_signatario(solicitacao: dict, info_cert: dict):
@@ -144,13 +174,27 @@ def _obter_docs_permitidos_solicitacao(solicitacao: dict) -> tuple[set[str], dic
     doc = solicitacao.get("documentos", {}) or {}
     remetente_id = doc.get("remetente_id")
     signatario_email = (solicitacao.get("signatario_email") or "").strip().lower()
+    assinatura_obrigatoria = "".join(
+        c for c in str(solicitacao.get("assinatura_obrigatoria_cpf_cnpj") or "")
+        if c.isdigit()
+    )
 
     remetente = db.buscar_usuario_por_id(remetente_id) if remetente_id else None
     cliente = db.buscar_usuario_por_email(signatario_email) if signatario_email else None
     if not remetente or not cliente:
+        if assinatura_obrigatoria:
+            return (
+                {assinatura_obrigatoria},
+                {
+                    "nome": solicitacao.get("assinatura_obrigatoria_nome")
+                    or solicitacao.get("signatario_nome")
+                    or signatario_email,
+                },
+                remetente or {},
+            )
         raise HTTPException(
             status_code=403,
-            detail="Signatário não vinculado. O cliente precisa estar cadastrado no sistema.",
+            detail="Signatario nao vinculado e sem documento obrigatorio configurado.",
         )
     if remetente.get("empresa_id") != cliente.get("empresa_id"):
         raise HTTPException(
@@ -1113,6 +1157,158 @@ async def listar_solicitacoes_cliente(cliente: dict = Depends(get_cliente_atual)
 
 
 # ============================================================
+# FLUXO PUBLICO INTERNO (SEM LOGIN)
+# ============================================================
+
+@app.post("/api/assinatura/criar")
+async def criar_solicitacao_publica(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    titulo: str = Form(""),
+    tipo_documento: str = Form(""),
+    signatario_nome: str = Form(...),
+    signatario_email: str = Form(...),
+    signatario_cpf_cnpj: str = Form(...),
+    mensagem: str = Form(""),
+    assinatura_pagina: int = Form(1),
+    assinatura_x: float = Form(0.06),
+    assinatura_y: float = Form(0.06),
+    assinatura_largura: float = Form(0.44),
+    assinatura_altura: float = Form(0.12),
+):
+    """Cria documento e link de assinatura sem depender de login."""
+    if not arquivo.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Apenas arquivos PDF sao aceitos")
+
+    conteudo = await arquivo.read()
+    if len(conteudo) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Arquivo excede 50MB")
+
+    signatario_email = (signatario_email or "").strip().lower()
+    signatario_nome = (signatario_nome or "").strip()
+    assinatura_doc = "".join(c for c in str(signatario_cpf_cnpj or "") if c.isdigit())
+    if len(assinatura_doc) not in (11, 14):
+        raise HTTPException(status_code=400, detail="CPF/CNPJ do signatario deve ter 11 ou 14 digitos")
+    if not signatario_email:
+        raise HTTPException(status_code=400, detail="Email do signatario e obrigatorio")
+
+    remetente = _obter_remetente_publico()
+    hash_sha256 = calcular_hash_pdf(conteudo)
+    storage_path = f"documentos/publico/{remetente['id']}/{uuid.uuid4()}/{arquivo.filename}"
+    db.upload_arquivo(storage_path, conteudo)
+
+    titulo_final = (titulo or tipo_documento or os.path.splitext(arquivo.filename)[0]).strip()
+    documento = db.criar_documento(
+        titulo=titulo_final,
+        nome_arquivo=arquivo.filename,
+        tamanho_bytes=len(conteudo),
+        hash_sha256=hash_sha256,
+        storage_path=storage_path,
+        remetente_id=remetente["id"],
+    )
+    if not documento:
+        raise HTTPException(status_code=500, detail="Nao foi possivel criar o documento")
+
+    pagina = max(1, int(assinatura_pagina or 1))
+    pos_x = _clamp_float(assinatura_x or 0.06, 0.0, 0.95)
+    pos_y = _clamp_float(assinatura_y or 0.06, 0.0, 0.95)
+    largura = _clamp_float(assinatura_largura or 0.44, 0.05, 1.0)
+    altura = _clamp_float(assinatura_altura or 0.12, 0.05, 1.0)
+
+    solicitacao = db.criar_solicitacao(
+        documento_id=documento["id"],
+        signatario_email=signatario_email,
+        signatario_nome=signatario_nome or signatario_email,
+        mensagem=(mensagem or "").strip() or None,
+        dias_expiracao=settings.signing_link_expiration_days,
+        assinatura_obrigatoria_tipo="cliente_cpf" if len(assinatura_doc) == 11 else "cliente_cnpj",
+        assinatura_obrigatoria_cpf_cnpj=assinatura_doc,
+        assinatura_obrigatoria_nome=signatario_nome or None,
+        assinatura_pagina=pagina,
+        assinatura_x=pos_x,
+        assinatura_y=pos_y,
+        assinatura_largura=largura,
+        assinatura_altura=altura,
+    )
+    if not solicitacao:
+        raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao de assinatura")
+
+    db.recalcular_status_documento(documento["id"])
+    link = f"{settings.frontend_url}/assinar/{solicitacao['token_acesso']}"
+
+    db.registrar_auditoria(
+        tipo_evento="SOLICITACAO_PUBLICA_CRIADA",
+        descricao=f"Solicitacao publica criada para {signatario_email}",
+        documento_id=documento["id"],
+        solicitacao_id=solicitacao["id"],
+        usuario_id=remetente["id"],
+        ip_origem=get_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        dados_extras={
+            "signatario_nome": signatario_nome,
+            "signatario_email": signatario_email,
+            "signatario_cpf_cnpj": assinatura_doc,
+        },
+    )
+
+    return {
+        "id": solicitacao["id"],
+        "documento_id": documento["id"],
+        "titulo": documento["titulo"],
+        "nome_arquivo": documento["nome_arquivo"],
+        "token_acesso": solicitacao["token_acesso"],
+        "signatario_nome": solicitacao.get("signatario_nome"),
+        "signatario_email": solicitacao.get("signatario_email"),
+        "assinatura_obrigatoria_cpf_cnpj": assinatura_doc,
+        "status": solicitacao["status"],
+        "expira_em": solicitacao["expira_em"],
+        "link_assinatura": link,
+    }
+
+
+@app.get("/api/assinatura/listar")
+async def listar_solicitacoes_publicas(limit: int = 50):
+    """Lista solicitacoes recentes do fluxo publico sem login."""
+    limit = max(1, min(limit, 200))
+    solicitacoes = db.listar_solicitacoes_recentes(limit)
+    agora = datetime.now(timezone.utc)
+    resultado = []
+
+    for sol in solicitacoes:
+        expira_em = sol.get("expira_em")
+        status_efetivo = sol.get("status") or "pendente"
+        if expira_em:
+            try:
+                expira_dt = datetime.fromisoformat(expira_em.replace("Z", "+00:00"))
+                if status_efetivo in ("pendente", "visualizado") and agora > expira_dt:
+                    status_efetivo = "expirado"
+            except Exception:
+                pass
+
+        doc = sol.get("documentos", {}) or {}
+        token = sol.get("token_acesso")
+        resultado.append({
+            "id": sol["id"],
+            "documento_id": sol.get("documento_id"),
+            "titulo": doc.get("titulo", ""),
+            "nome_arquivo": doc.get("nome_arquivo", ""),
+            "signatario_nome": sol.get("signatario_nome"),
+            "signatario_email": sol.get("signatario_email"),
+            "assinatura_obrigatoria_cpf_cnpj": sol.get("assinatura_obrigatoria_cpf_cnpj"),
+            "mensagem": sol.get("mensagem"),
+            "status": status_efetivo,
+            "criado_em": sol.get("criado_em"),
+            "assinado_em": sol.get("assinado_em"),
+            "expira_em": expira_em,
+            "token_acesso": token,
+            "tem_assinado": bool(doc.get("storage_path_assinado")),
+            "link_assinatura": f"{settings.frontend_url}/assinar/{token}" if token else None,
+        })
+
+    return resultado
+
+
+# ============================================================
 # ENDPOINTS PÃšBLICOS (ACESSO VIA TOKEN DE ASSINATURA)
 # ============================================================
 
@@ -1439,9 +1635,6 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
 
 
 

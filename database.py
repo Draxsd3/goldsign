@@ -487,6 +487,20 @@ def listar_solicitacoes_cliente(cliente_id: str) -> list:
     return resultado.data or []
 
 
+def listar_solicitacoes_recentes(limit: int = 100) -> list:
+    db = get_supabase()
+    resultado = (
+        db.table("solicitacoes_assinatura")
+        .select(
+            "*, documentos(id, titulo, nome_arquivo, tamanho_bytes, status, storage_path_assinado, criado_em)"
+        )
+        .order("criado_em", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resultado.data or []
+
+
 # ============================================================
 # ASSINATURAS
 # ============================================================
@@ -607,7 +621,6 @@ def gerar_url_assinada(caminho: str, expira_em_segundos: int = 3600) -> str:
         caminho, expira_em_segundos
     )
     return resultado.get("signedURL", "")
-
 
 
 

@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     # App
     app_name: str = "Assinatura Digital ICP-Brasil"
     frontend_url: str = "http://localhost:3000"
+    frontend_urls: str | None = None
     backend_url: str = "http://localhost:8000"
+    public_sender_email: str = "assinaturas@goldsign.local"
+    public_sender_name: str = "Operacao GoldSign"
 
     # Assinatura
     signature_field_name: str = "AssinaturaICP"
