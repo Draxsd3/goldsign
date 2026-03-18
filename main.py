@@ -64,6 +64,8 @@ def _build_cors_origins() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
     }
@@ -1698,85 +1700,95 @@ async def preparar_assinatura(token: str, request: Request):
 @app.post("/api/assinatura/submeter", response_model=AssinaturaResponse)
 async def submeter_assinatura(dados: SubmeterAssinaturaRequest, request: Request):
     """Recebe a assinatura CMS/PKCS#7 e incorpora ao PDF no padrÃ£o PAdES."""
-    solicitacao = db.buscar_solicitacao_por_token(dados.token_acesso)
-    if not solicitacao:
-        raise HTTPException(status_code=404, detail="SolicitaÃ§Ã£o nÃ£o encontrada")
+    try:
+        solicitacao = db.buscar_solicitacao_por_token(dados.token_acesso)
+        if not solicitacao:
+            raise HTTPException(status_code=404, detail="SolicitaÃ§Ã£o nÃ£o encontrada")
 
-    if solicitacao["status"] == "assinado":
-        raise HTTPException(status_code=400, detail="Documento jÃ¡ foi assinado")
-    _garantir_ordem_assinatura(solicitacao)
+        if solicitacao["status"] == "assinado":
+            raise HTTPException(status_code=400, detail="Documento jÃ¡ foi assinado")
+        _garantir_ordem_assinatura(solicitacao)
 
-    doc = solicitacao.get("documentos", {})
-    info_cert = extrair_info_certificado(dados.cert_pem)
-    _validar_certificado_signatario(solicitacao, info_cert)
+        doc = solicitacao.get("documentos", {})
+        info_cert = extrair_info_certificado(dados.cert_pem)
+        _validar_certificado_signatario(solicitacao, info_cert)
 
-    contexto_assinatura = _assinaturas_pendentes.pop(dados.token_acesso, None)
-    _documentos_em_preparacao.pop(solicitacao["documento_id"], None)
-    if not contexto_assinatura:
-        raise HTTPException(
-            status_code=400,
-            detail="PreparaÃ§Ã£o de assinatura nÃ£o encontrada. Execute /preparar novamente.",
+        contexto_assinatura = _assinaturas_pendentes.pop(dados.token_acesso, None)
+        _documentos_em_preparacao.pop(solicitacao["documento_id"], None)
+        if not contexto_assinatura:
+            raise HTTPException(
+                status_code=400,
+                detail="PreparaÃ§Ã£o de assinatura nÃ£o encontrada. Execute /preparar novamente.",
+            )
+
+        pdf_assinado = await asyncio.to_thread(
+            aplicar_cms_em_pdf_preparado,
+            contexto_assinatura["prepared_pdf_b64"],
+            dados.assinatura_cms_b64,
+            contexto_assinatura["document_digest_hex"],
+            contexto_assinatura["reserved_region_start"],
+            contexto_assinatura["reserved_region_end"],
         )
 
-    pdf_assinado = await asyncio.to_thread(
-        aplicar_cms_em_pdf_preparado,
-        contexto_assinatura["prepared_pdf_b64"],
-        dados.assinatura_cms_b64,
-        contexto_assinatura["document_digest_hex"],
-        contexto_assinatura["reserved_region_start"],
-        contexto_assinatura["reserved_region_end"],
-    )
+        storage_path_assinado = doc.get("storage_path_assinado") or doc["storage_path"].replace(".pdf", "_assinado.pdf")
+        db.upload_arquivo(storage_path_assinado, pdf_assinado)
 
-    storage_path_assinado = doc.get("storage_path_assinado") or doc["storage_path"].replace(".pdf", "_assinado.pdf")
-    db.upload_arquivo(storage_path_assinado, pdf_assinado)
-
-    agora = datetime.now(timezone.utc).isoformat()
-    assinatura_registro = db.criar_assinatura({
-        "solicitacao_id": solicitacao["id"],
-        "documento_id": solicitacao["documento_id"],
-        "cert_subject_cn": info_cert.get("subject_cn"),
-        "cert_subject_cpf": info_cert.get("cpf"),
-        "cert_issuer_cn": info_cert.get("issuer_cn"),
-        "cert_serial_number": info_cert.get("serial_number"),
-        "cert_not_before": info_cert.get("not_before"),
-        "cert_not_after": info_cert.get("not_after"),
-        "cert_tipo": dados.cert_tipo,
-        "cert_pem": dados.cert_pem,
-        "hash_conteudo_assinado": contexto_assinatura["document_digest_hex"],
-        "algoritmo_assinatura": "SHA256withRSA",
-        "ip_signatario": get_client_ip(request),
-        "user_agent": request.headers.get("user-agent"),
-    })
-
-    db.atualizar_solicitacao(solicitacao["id"], {"status": "assinado", "assinado_em": agora})
-    db.atualizar_documento(solicitacao["documento_id"], {"storage_path_assinado": storage_path_assinado})
-    db.recalcular_status_documento(solicitacao["documento_id"])
-
-    db.registrar_auditoria(
-        tipo_evento="DOCUMENTO_ASSINADO",
-        descricao=f"Documento assinado por {info_cert.get('subject_cn')}",
-        documento_id=solicitacao["documento_id"],
-        solicitacao_id=solicitacao["id"],
-        ip_origem=get_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
-        dados_extras={
-            "cert_cn": info_cert.get("subject_cn"),
-            "cert_cpf": info_cert.get("cpf"),
-            "cert_issuer": info_cert.get("issuer_cn"),
+        agora = datetime.now(timezone.utc).isoformat()
+        assinatura_registro = db.criar_assinatura({
+            "solicitacao_id": solicitacao["id"],
+            "documento_id": solicitacao["documento_id"],
+            "cert_subject_cn": info_cert.get("subject_cn"),
+            "cert_subject_cpf": info_cert.get("cpf"),
+            "cert_issuer_cn": info_cert.get("issuer_cn"),
+            "cert_serial_number": info_cert.get("serial_number"),
+            "cert_not_before": info_cert.get("not_before"),
+            "cert_not_after": info_cert.get("not_after"),
             "cert_tipo": dados.cert_tipo,
-        },
-    )
+            "cert_pem": dados.cert_pem,
+            "hash_conteudo_assinado": contexto_assinatura["document_digest_hex"],
+            "algoritmo_assinatura": "SHA256withRSA",
+            "ip_signatario": get_client_ip(request),
+            "user_agent": request.headers.get("user-agent"),
+        })
+        if not assinatura_registro:
+            raise HTTPException(status_code=500, detail="Nao foi possivel registrar a assinatura no banco de dados.")
 
-    return AssinaturaResponse(
-        id=assinatura_registro["id"],
-        documento_id=solicitacao["documento_id"],
-        cert_subject_cn=info_cert.get("subject_cn", ""),
-        cert_subject_cpf=info_cert.get("cpf"),
-        cert_issuer_cn=info_cert.get("issuer_cn", ""),
-        assinado_em=agora,
-        sucesso=True,
-        mensagem="Documento assinado com sucesso no padrÃ£o PAdES",
-    )
+        db.atualizar_solicitacao(solicitacao["id"], {"status": "assinado", "assinado_em": agora})
+        db.atualizar_documento(solicitacao["documento_id"], {"storage_path_assinado": storage_path_assinado})
+        db.recalcular_status_documento(solicitacao["documento_id"])
+
+        db.registrar_auditoria(
+            tipo_evento="DOCUMENTO_ASSINADO",
+            descricao=f"Documento assinado por {info_cert.get('subject_cn')}",
+            documento_id=solicitacao["documento_id"],
+            solicitacao_id=solicitacao["id"],
+            ip_origem=get_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            dados_extras={
+                "cert_cn": info_cert.get("subject_cn"),
+                "cert_cpf": info_cert.get("cpf"),
+                "cert_issuer": info_cert.get("issuer_cn"),
+                "cert_tipo": dados.cert_tipo,
+            },
+        )
+
+        return AssinaturaResponse(
+            id=assinatura_registro["id"],
+            documento_id=solicitacao["documento_id"],
+            cert_subject_cn=info_cert.get("subject_cn", ""),
+            cert_subject_cpf=info_cert.get("cpf"),
+            cert_issuer_cn=info_cert.get("issuer_cn", ""),
+            assinado_em=agora,
+            sucesso=True,
+            mensagem="Documento assinado com sucesso no padrÃ£o PAdES",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Falha ao submeter assinatura do cedente: {exc}",
+        )
 
 
 @app.get("/api/assinatura/{token}/download-assinado")
