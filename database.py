@@ -624,7 +624,10 @@ def upload_arquivo(caminho: str, conteudo: bytes, content_type: str = "applicati
     db.storage.from_(settings.supabase_bucket).upload(
         path=caminho,
         file=conteudo,
-        file_options={"content-type": content_type}
+        file_options={
+            "content-type": content_type,
+            "upsert": "true",
+        }
     )
     return caminho
 
@@ -651,5 +654,4 @@ def gerar_url_assinada(caminho: str, expira_em_segundos: int = 3600) -> str:
         caminho, expira_em_segundos
     )
     return resultado.get("signedURL", "")
-
 
