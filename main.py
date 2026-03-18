@@ -1474,6 +1474,14 @@ async def criar_solicitacao_publica(
     }
 
 
+@app.get("/api/assinatura/criar")
+async def obter_info_criar_solicitacao_publica():
+    raise HTTPException(
+        status_code=405,
+        detail="Use POST /api/assinatura/criar com multipart/form-data para criar uma solicitacao.",
+    )
+
+
 @app.get("/api/assinatura/listar")
 async def listar_solicitacoes_publicas(limit: int = 50):
     """Lista solicitacoes recentes do fluxo publico sem login."""

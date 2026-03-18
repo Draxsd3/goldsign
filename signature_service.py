@@ -11,6 +11,8 @@ ResponsÃ¡vel por:
 import hashlib
 import io
 import base64
+import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Tuple
 
@@ -553,10 +555,28 @@ def assinar_pdf_servidor(
 
     settings_cfg = get_settings()
 
-    signer = signers.SimpleSigner.load_pkcs12(
-        pkcs12_bytes,
-        passphrase=pkcs12_password or None,
-    )
+    if not pkcs12_bytes:
+        raise ValueError("Certificado PKCS12 da Gold Credit nao foi informado.")
+
+    temp_pfx_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".p12") as temp_pfx:
+            temp_pfx.write(pkcs12_bytes)
+            temp_pfx_path = temp_pfx.name
+
+        signer = signers.SimpleSigner.load_pkcs12(
+            temp_pfx_path,
+            passphrase=pkcs12_password or None,
+        )
+    finally:
+        if temp_pfx_path and os.path.exists(temp_pfx_path):
+            os.unlink(temp_pfx_path)
+
+    if signer is None:
+        raise ValueError(
+            "Nao foi possivel carregar o certificado PKCS12 da Gold Credit. "
+            "Verifique GOLD_CREDIT_PKCS12_B64 e GOLD_CREDIT_PKCS12_PASSWORD."
+        )
 
     input_buf = io.BytesIO(pdf_bytes)
     reader = PdfFileReader(input_buf)
