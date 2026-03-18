@@ -601,6 +601,16 @@ def assinar_pdf_servidor(
     pdf_signer = signers.PdfSigner(
         signature_meta=sig_meta,
         signer=signer,
+        stamp_style=TextStampStyle(
+            stamp_text=(
+                "Assinado digitalmente\n"
+                "%(signer)s\n"
+                "%(ts)s"
+            ),
+            background_opacity=0.08,
+            border_width=1,
+            text_box_style=TextBoxStyle(font_size=6),
+        ),
         new_field_spec=SigFieldSpec(
             sig_field_name=field_name,
             on_page=pagina_idx,
@@ -611,7 +621,14 @@ def assinar_pdf_servidor(
     output_buf = io.BytesIO()
 
     async def _sign():
-        await pdf_signer.async_sign_pdf(writer, output=output_buf)
+        await pdf_signer.async_sign_pdf(
+            writer,
+            output=output_buf,
+            appearance_text_params={
+                "signer": settings_cfg.gold_credit_signer_name,
+                "ts": datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M"),
+            },
+        )
 
     asyncio.run(_sign())
 

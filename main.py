@@ -1258,6 +1258,10 @@ async def criar_solicitacao_publica(
     assinatura_largura: float = Form(0.44),
     assinatura_altura: float = Form(0.12),
     assinatura_pagina_gc: int = Form(0),
+    assinatura_x_gc: float = Form(0.06),
+    assinatura_y_gc: float = Form(0.41),
+    assinatura_largura_gc: float = Form(0.34),
+    assinatura_altura_gc: float = Form(0.07),
     responsavel_solidario_nome: str = Form(""),
     responsavel_solidario_email: str = Form(""),
     responsavel_solidario_cpf_cnpj: str = Form(""),
@@ -1337,10 +1341,10 @@ async def criar_solicitacao_publica(
             raise HTTPException(status_code=500, detail="Configuracao da Gold Credit invalida")
 
         gc_pagina = max(1, int(assinatura_pagina_gc or settings.gold_credit_signature_page or 12))
-        gc_x = _clamp_float(settings.gold_credit_signature_x, 0.0, 0.95)
-        gc_y = _clamp_float(settings.gold_credit_signature_y, 0.0, 0.95)
-        gc_largura = _clamp_float(settings.gold_credit_signature_width, 0.05, 1.0)
-        gc_altura = _clamp_float(settings.gold_credit_signature_height, 0.05, 1.0)
+        gc_x = _clamp_float(assinatura_x_gc or settings.gold_credit_signature_x, 0.0, 0.95)
+        gc_y = _clamp_float(assinatura_y_gc or settings.gold_credit_signature_y, 0.0, 0.95)
+        gc_largura = _clamp_float(assinatura_largura_gc or settings.gold_credit_signature_width, 0.05, 1.0)
+        gc_altura = _clamp_float(assinatura_altura_gc or settings.gold_credit_signature_height, 0.05, 1.0)
 
         solicitacao_gold_credit = db.criar_solicitacao(
             documento_id=documento["id"],
