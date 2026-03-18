@@ -25,6 +25,7 @@ from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.sign.fields import SigFieldSpec, SigSeedSubFilter
 from pyhanko.stamp import TextStampStyle
+from pyhanko.pdf_utils.text import TextBoxStyle
 from pyhanko.sign.signers.pdf_byterange import PreparedByteRangeDigest
 from pyhanko.sign.signers.pdf_signer import PdfTBSDocument
 
@@ -232,6 +233,16 @@ def preparar_documento_pades_externo(
     pdf_signer = signers.PdfSigner(
         signature_meta=sig_meta,
         signer=ext_signer,
+        stamp_style=TextStampStyle(
+            stamp_text=(
+                "Assinado digitalmente\n"
+                "%(signer)s\n"
+                "%(ts)s"
+            ),
+            background_opacity=0.10,
+            border_width=1,
+            text_box_style=TextBoxStyle(font_size=8),
+        ),
         new_field_spec=SigFieldSpec(
             sig_field_name=field_name,
             on_page=pagina_idx,
@@ -519,3 +530,77 @@ def _aplicar_selo_visual(pdf_bytes: bytes, texto_selo: str) -> bytes:
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+def assinar_pdf_servidor(
+    pdf_bytes: bytes,
+    field_name: str,
+    assinatura_pagina: int = 1,
+    assinatura_x: float = 0.06,
+    assinatura_y: float = 0.06,
+    assinatura_largura: float = 0.44,
+    assinatura_altura: float = 0.12,
+    pkcs12_bytes: bytes = b"",
+    pkcs12_password: bytes = b"",
+) -> tuple[bytes, str]:
+    """
+    Assina o PDF no servidor usando certificado PKCS12 (A1) de forma sincrona.
+    Retorna (pdf_assinado_bytes, cert_pem_str).
+
+    Deve ser chamado via asyncio.to_thread() para nao bloquear o event loop.
+    """
+    import asyncio
+
+    settings_cfg = get_settings()
+
+    signer = signers.SimpleSigner.load_pkcs12(
+        pkcs12_bytes,
+        passphrase=pkcs12_password or None,
+    )
+
+    input_buf = io.BytesIO(pdf_bytes)
+    reader = PdfFileReader(input_buf)
+    pagina_idx, box = _obter_box_assinatura(
+        reader=reader,
+        pagina_1_based=assinatura_pagina,
+        x_norm=assinatura_x,
+        y_norm=assinatura_y,
+        largura_norm=assinatura_largura,
+        altura_norm=assinatura_altura,
+    )
+
+    writer = IncrementalPdfFileWriter(input_buf)
+    sig_meta = signers.PdfSignatureMetadata(
+        field_name=field_name,
+        md_algorithm="sha256",
+        reason=settings_cfg.signature_reason,
+        location=settings_cfg.signature_location,
+        subfilter=SigSeedSubFilter.PADES,
+    )
+
+    pdf_signer = signers.PdfSigner(
+        signature_meta=sig_meta,
+        signer=signer,
+        new_field_spec=SigFieldSpec(
+            sig_field_name=field_name,
+            on_page=pagina_idx,
+            box=box,
+        ),
+    )
+
+    output_buf = io.BytesIO()
+
+    async def _sign():
+        await pdf_signer.async_sign_pdf(writer, output=output_buf)
+
+    asyncio.run(_sign())
+
+    # Extrair PEM do certificado de assinatura
+    cert_der = signer.signing_cert.dump()
+    cert_pem = (
+        "-----BEGIN CERTIFICATE-----\n"
+        + base64.b64encode(cert_der).decode("ascii")
+        + "\n-----END CERTIFICATE-----\n"
+    )
+
+    return output_buf.getvalue(), cert_pem

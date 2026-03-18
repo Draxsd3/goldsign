@@ -36,6 +36,7 @@ from signature_service import (
     preparar_documento_pades_externo,
     aplicar_cms_em_pdf_preparado,
     extrair_info_certificado,
+    assinar_pdf_servidor,
 )
 from schemas import (
     LoginRequest, TokenResponse, AtualizarPerfilRequest,
@@ -1249,11 +1250,20 @@ async def criar_solicitacao_publica(
     mensagem: str = Form(""),
     contrato_mae: bool = Form(False),
     incluir_assinatura_gold_credit: bool = Form(False),
-    assinatura_pagina: int = Form(1),
+    assinatura_pagina: int = Form(0),
     assinatura_x: float = Form(0.06),
     assinatura_y: float = Form(0.06),
     assinatura_largura: float = Form(0.44),
     assinatura_altura: float = Form(0.12),
+    assinatura_pagina_gc: int = Form(0),
+    responsavel_solidario_nome: str = Form(""),
+    responsavel_solidario_email: str = Form(""),
+    responsavel_solidario_cpf_cnpj: str = Form(""),
+    assinatura_pagina_rs: int = Form(0),
+    assinatura_x_rs: float = Form(0.52),
+    assinatura_y_rs: float = Form(0.08),
+    assinatura_largura_rs: float = Form(0.44),
+    assinatura_altura_rs: float = Form(0.12),
 ):
     """Cria documento e link de assinatura sem depender de login."""
     if not arquivo.filename.lower().endswith(".pdf"):
@@ -1288,18 +1298,16 @@ async def criar_solicitacao_publica(
     if not documento:
         raise HTTPException(status_code=500, detail="Nao foi possivel criar o documento")
 
+    # Posições sempre vêm do formulário (drag UI). Para contrato_mae, a página
+    # usa o padrão das configurações se não informada explicitamente.
     if contrato_mae:
-        pagina = max(1, int(settings.contract_mother_signature_page or 12))
-        pos_x = _clamp_float(settings.contract_mother_signature_x, 0.0, 0.95)
-        pos_y = _clamp_float(settings.contract_mother_signature_y, 0.0, 0.95)
-        largura = _clamp_float(settings.contract_mother_signature_width, 0.05, 1.0)
-        altura = _clamp_float(settings.contract_mother_signature_height, 0.05, 1.0)
+        pagina = max(1, int(assinatura_pagina or settings.contract_mother_signature_page or 12))
     else:
         pagina = max(1, int(assinatura_pagina or 1))
-        pos_x = _clamp_float(assinatura_x or 0.06, 0.0, 0.95)
-        pos_y = _clamp_float(assinatura_y or 0.06, 0.0, 0.95)
-        largura = _clamp_float(assinatura_largura or 0.44, 0.05, 1.0)
-        altura = _clamp_float(assinatura_altura or 0.12, 0.05, 1.0)
+    pos_x = _clamp_float(assinatura_x or 0.06, 0.0, 0.95)
+    pos_y = _clamp_float(assinatura_y or 0.06, 0.0, 0.95)
+    largura = _clamp_float(assinatura_largura or 0.44, 0.05, 1.0)
+    altura = _clamp_float(assinatura_altura or 0.12, 0.05, 1.0)
 
     solicitacao = db.criar_solicitacao(
         documento_id=documento["id"],
@@ -1326,6 +1334,12 @@ async def criar_solicitacao_publica(
         if len(gold_credit_doc) != 14:
             raise HTTPException(status_code=500, detail="Configuracao da Gold Credit invalida")
 
+        gc_pagina = max(1, int(assinatura_pagina_gc or settings.gold_credit_signature_page or 12))
+        gc_x = _clamp_float(settings.gold_credit_signature_x, 0.0, 0.95)
+        gc_y = _clamp_float(settings.gold_credit_signature_y, 0.0, 0.95)
+        gc_largura = _clamp_float(settings.gold_credit_signature_width, 0.05, 1.0)
+        gc_altura = _clamp_float(settings.gold_credit_signature_height, 0.05, 1.0)
+
         solicitacao_gold_credit = db.criar_solicitacao(
             documento_id=documento["id"],
             signatario_email=(settings.gold_credit_signer_email or settings.public_sender_email).strip().lower(),
@@ -1335,16 +1349,104 @@ async def criar_solicitacao_publica(
             assinatura_obrigatoria_tipo="cliente_cnpj",
             assinatura_obrigatoria_cpf_cnpj=gold_credit_doc,
             assinatura_obrigatoria_nome=settings.gold_credit_signer_name,
-            assinatura_pagina=max(1, int(settings.gold_credit_signature_page or 12)),
-            assinatura_x=_clamp_float(settings.gold_credit_signature_x, 0.0, 0.95),
-            assinatura_y=_clamp_float(settings.gold_credit_signature_y, 0.0, 0.95),
-            assinatura_largura=_clamp_float(settings.gold_credit_signature_width, 0.05, 1.0),
-            assinatura_altura=_clamp_float(settings.gold_credit_signature_height, 0.05, 1.0),
+            assinatura_pagina=gc_pagina,
+            assinatura_x=gc_x,
+            assinatura_y=gc_y,
+            assinatura_largura=gc_largura,
+            assinatura_altura=gc_altura,
         )
         if not solicitacao_gold_credit:
             raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao da Gold Credit")
 
+        # Assinatura automatica obrigatoria: a cessionaria Gold Credit somos nos.
+        # Se o certificado nao estiver configurado ou a assinatura falhar, retorna erro.
+        if not settings.gold_credit_pkcs12_b64:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Certificado da cessionaria Gold Credit nao configurado no servidor. "
+                    "Adicione GOLD_CREDIT_PKCS12_B64 e GOLD_CREDIT_PKCS12_PASSWORD no .env."
+                ),
+            )
+
+        try:
+            pkcs12_bytes = base64.b64decode(settings.gold_credit_pkcs12_b64)
+            pkcs12_password = (settings.gold_credit_pkcs12_password or "").encode()
+            gc_field_name = _field_name_solicitacao(solicitacao_gold_credit["id"])
+
+            pdf_assinado_gc, cert_pem_gc = await asyncio.to_thread(
+                assinar_pdf_servidor,
+                conteudo,
+                gc_field_name,
+                gc_pagina,
+                gc_x,
+                gc_y,
+                gc_largura,
+                gc_altura,
+                pkcs12_bytes,
+                pkcs12_password,
+            )
+
+            storage_path_assinado_gc = documento["storage_path"].replace(".pdf", "_assinado.pdf")
+            db.upload_arquivo(storage_path_assinado_gc, pdf_assinado_gc)
+
+            info_cert_gc = extrair_info_certificado(cert_pem_gc)
+            agora_gc = datetime.now(timezone.utc).isoformat()
+
+            db.criar_assinatura({
+                "solicitacao_id": solicitacao_gold_credit["id"],
+                "documento_id": documento["id"],
+                "cert_subject_cn": info_cert_gc.get("subject_cn"),
+                "cert_subject_cpf": info_cert_gc.get("cpf"),
+                "cert_issuer_cn": info_cert_gc.get("issuer_cn"),
+                "cert_serial_number": info_cert_gc.get("serial_number"),
+                "cert_not_before": info_cert_gc.get("not_before"),
+                "cert_not_after": info_cert_gc.get("not_after"),
+                "cert_tipo": "A1",
+                "cert_pem": cert_pem_gc,
+                "hash_conteudo_assinado": calcular_hash_pdf(conteudo),
+                "algoritmo_assinatura": "SHA256withRSA",
+                "ip_signatario": get_client_ip(request),
+                "user_agent": request.headers.get("user-agent"),
+            })
+
+            db.atualizar_solicitacao(solicitacao_gold_credit["id"], {"status": "assinado", "assinado_em": agora_gc})
+            db.atualizar_documento(documento["id"], {"storage_path_assinado": storage_path_assinado_gc})
+            db.recalcular_status_documento(documento["id"])
+
+            solicitacao_gold_credit = {**solicitacao_gold_credit, "status": "assinado"}
+        except HTTPException:
+            raise
+        except Exception as exc_gc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Falha ao aplicar assinatura automatica da cessionaria Gold Credit: {exc_gc}",
+            )
+
         solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_gold_credit))
+
+    # Responsavel solidario (opcional)
+    rs_doc = "".join(c for c in str(responsavel_solidario_cpf_cnpj or "") if c.isdigit())
+    rs_email = (responsavel_solidario_email or "").strip().lower()
+    if rs_doc and len(rs_doc) in (11, 14) and rs_email:
+        pagina_rs = max(1, int(assinatura_pagina_rs or assinatura_pagina or 1))
+        solicitacao_rs = db.criar_solicitacao(
+            documento_id=documento["id"],
+            signatario_email=rs_email,
+            signatario_nome=(responsavel_solidario_nome or rs_email).strip(),
+            mensagem=(mensagem or "").strip() or None,
+            dias_expiracao=settings.signing_link_expiration_days,
+            assinatura_obrigatoria_tipo="cliente_cpf" if len(rs_doc) == 11 else "cliente_cnpj",
+            assinatura_obrigatoria_cpf_cnpj=rs_doc,
+            assinatura_obrigatoria_nome=(responsavel_solidario_nome or None),
+            assinatura_pagina=pagina_rs,
+            assinatura_x=_clamp_float(assinatura_x_rs or 0.52, 0.0, 0.95),
+            assinatura_y=_clamp_float(assinatura_y_rs or 0.08, 0.0, 0.95),
+            assinatura_largura=_clamp_float(assinatura_largura_rs or 0.44, 0.05, 1.0),
+            assinatura_altura=_clamp_float(assinatura_altura_rs or 0.12, 0.05, 1.0),
+        )
+        if solicitacao_rs:
+            solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_rs))
 
     db.recalcular_status_documento(documento["id"])
 

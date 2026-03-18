@@ -32,14 +32,14 @@ class Settings(BaseSettings):
     gold_credit_signer_document: str = "39575046000174"
     gold_credit_signature_page: int = 12
     gold_credit_signature_x: float = 0.06
-    gold_credit_signature_y: float = 0.34
-    gold_credit_signature_width: float = 0.44
-    gold_credit_signature_height: float = 0.10
+    gold_credit_signature_y: float = 0.41
+    gold_credit_signature_width: float = 0.34
+    gold_credit_signature_height: float = 0.07
     contract_mother_signature_page: int = 12
     contract_mother_signature_x: float = 0.06
-    contract_mother_signature_y: float = 0.72
-    contract_mother_signature_width: float = 0.44
-    contract_mother_signature_height: float = 0.10
+    contract_mother_signature_y: float = 0.54
+    contract_mother_signature_width: float = 0.34
+    contract_mother_signature_height: float = 0.07
 
     # Assinatura
     signature_field_name: str = "AssinaturaICP"
@@ -48,6 +48,11 @@ class Settings(BaseSettings):
 
     # Link
     signing_link_expiration_days: int = 7
+
+    # Certificado A1 do servidor para assinatura automatica da cessionaria Gold Credit
+    # Valor: PKCS12 (.pfx) codificado em base64. Vazio = assinatura manual necessaria.
+    gold_credit_pkcs12_b64: str | None = None
+    gold_credit_pkcs12_password: str = ""
 
     @model_validator(mode="after")
     def validar_supabase(self):
