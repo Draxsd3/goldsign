@@ -1370,7 +1370,8 @@ async def criar_solicitacao_publica(
             )
 
         try:
-            pkcs12_bytes = base64.b64decode(settings.gold_credit_pkcs12_b64)
+            pkcs12_b64_clean = "".join(settings.gold_credit_pkcs12_b64.split())
+            pkcs12_bytes = base64.b64decode(pkcs12_b64_clean)
             pkcs12_password = (settings.gold_credit_pkcs12_password or "").encode()
             gc_field_name = _field_name_solicitacao(solicitacao_gold_credit["id"])
 
