@@ -213,7 +213,7 @@ def _garantir_ordem_assinatura(solicitacao: dict):
 
     raise HTTPException(
         status_code=423,
-        detail="Este contrato-mae ainda aguarda a assinatura da cessionaria Gold Credit antes de liberar o link do cedente.",
+        detail="Este documento ainda aguarda a assinatura da cessionaria Gold Credit antes de liberar o link do cedente.",
     )
 
 
