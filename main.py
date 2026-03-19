@@ -180,6 +180,8 @@ def _gold_credit_documento() -> str:
 
 
 def _papel_solicitacao(solicitacao: dict) -> str:
+    if (solicitacao.get("assinatura_obrigatoria_tipo") or "").strip().lower() == "responsavel_solidario":
+        return "responsavel_solidario"
     assinatura_doc = "".join(
         c for c in str(solicitacao.get("assinatura_obrigatoria_cpf_cnpj") or "")
         if c.isdigit()
@@ -1443,7 +1445,7 @@ async def criar_solicitacao_publica(
             signatario_nome=(responsavel_solidario_nome or rs_email).strip(),
             mensagem=(mensagem or "").strip() or None,
             dias_expiracao=settings.signing_link_expiration_days,
-            assinatura_obrigatoria_tipo="cliente_cpf" if len(rs_doc) == 11 else "cliente_cnpj",
+            assinatura_obrigatoria_tipo="responsavel_solidario",
             assinatura_obrigatoria_cpf_cnpj=rs_doc,
             assinatura_obrigatoria_nome=(responsavel_solidario_nome or None),
             assinatura_pagina=pagina_rs,
