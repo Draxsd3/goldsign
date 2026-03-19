@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # App
     app_name: str = "Assinatura Digital ICP-Brasil"
-    frontend_url: str = "http://localhost:3000"
+    frontend_url: str = "https://operacoes.goldcreditcapital.com.br"
     frontend_urls: str | None = None
     backend_url: str = "http://localhost:8000"
     public_sender_email: str = "assinaturas@goldsign.local"
