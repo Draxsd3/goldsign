@@ -1463,7 +1463,7 @@ async def criar_solicitacao_publica(request: Request):
     for chave, valor in form.multi_items():
         if chave not in ("arquivos", "arquivo"):
             continue
-        if isinstance(valor, UploadFile):
+        if hasattr(valor, "filename") and hasattr(valor, "read"):
             arquivos_recebidos.append(valor)
     if not arquivos_recebidos:
         raise HTTPException(status_code=400, detail="Envie pelo menos um arquivo PDF")
