@@ -531,6 +531,21 @@ def listar_solicitacoes_recentes(limit: int = 100) -> list:
     return resultado.data or []
 
 
+def listar_solicitacoes_por_bundle_token(bundle_token: str, limit: int = 500) -> list:
+    db = get_supabase()
+    resultado = (
+        db.table("solicitacoes_assinatura")
+        .select(
+            "*, documentos(id, titulo, nome_arquivo, tamanho_bytes, status, storage_path, storage_path_assinado, criado_em)"
+        )
+        .like("mensagem", f"%bundle={bundle_token}|%")
+        .order("criado_em")
+        .limit(limit)
+        .execute()
+    )
+    return resultado.data or []
+
+
 # ============================================================
 # ASSINATURAS
 # ============================================================
@@ -654,4 +669,3 @@ def gerar_url_assinada(caminho: str, expira_em_segundos: int = 3600) -> str:
         caminho, expira_em_segundos
     )
     return resultado.get("signedURL", "")
-

@@ -11,6 +11,7 @@ PapÃ©is de usuÃ¡rio:
 import uuid
 import asyncio
 import base64
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ _documentos_em_preparacao: dict[str, str] = {}  # documento_id → token
 
 # Desafios de autenticaÃ§Ã£o por certificado: {nonce_id: {"desafio": bytes, "expira_em": float}}
 _desafios_pendentes: dict[str, dict] = {}
+_FLOW_META_PREFIX = "[GSFLOW|"
 
 
 def _build_cors_origins() -> list[str]:
@@ -123,6 +125,82 @@ def _clamp_float(valor: float, minimo: float, maximo: float) -> float:
     return max(minimo, min(maximo, float(valor)))
 
 
+def _parse_flow_metadata(mensagem: str | None) -> tuple[dict[str, str], str | None]:
+    mensagem = (mensagem or "").strip()
+    if not mensagem.startswith(_FLOW_META_PREFIX):
+        return {}, mensagem or None
+
+    first_line, _, rest = mensagem.partition("\n")
+    if not first_line.endswith("]"):
+        return {}, mensagem or None
+
+    meta: dict[str, str] = {}
+    for part in first_line[len(_FLOW_META_PREFIX):-1].split("|"):
+        if "=" not in part:
+            continue
+        chave, valor = part.split("=", 1)
+        meta[chave.strip()] = valor.strip()
+
+    return meta, (rest.strip() or None)
+
+
+def _build_flow_message(
+    mensagem: str | None,
+    *,
+    operation_id: str | None = None,
+    bundle_token: str | None = None,
+    role: str | None = None,
+    document_index: int | None = None,
+    total_documents: int | None = None,
+) -> str | None:
+    parts = []
+    if operation_id:
+        parts.append(f"op={operation_id}")
+    if bundle_token:
+        parts.append(f"bundle={bundle_token}")
+    if role:
+        parts.append(f"role={role}")
+    if document_index is not None:
+        parts.append(f"idx={document_index}")
+    if total_documents is not None:
+        parts.append(f"total={total_documents}")
+
+    clean_message = (mensagem or "").strip()
+    if not parts:
+        return clean_message or None
+
+    prefix = f"{_FLOW_META_PREFIX}{'|'.join(parts)}]"
+    return f"{prefix}\n{clean_message}" if clean_message else prefix
+
+
+def _extract_flow_fields(solicitacao: dict) -> dict[str, str | int | None]:
+    meta, clean_message = _parse_flow_metadata(solicitacao.get("mensagem"))
+    total_docs = meta.get("total")
+    doc_index = meta.get("idx")
+    return {
+        "operacao_id": meta.get("op"),
+        "bundle_token": meta.get("bundle"),
+        "bundle_role": meta.get("role"),
+        "operacao_total_documentos": int(total_docs) if total_docs and total_docs.isdigit() else None,
+        "operacao_documento_indice": int(doc_index) if doc_index and doc_index.isdigit() else None,
+        "mensagem_limpa": clean_message,
+    }
+
+
+def _status_efetivo_solicitacao(sol: dict, agora: datetime | None = None) -> str:
+    agora = agora or datetime.now(timezone.utc)
+    expira_em = sol.get("expira_em")
+    status_efetivo = sol.get("status") or "pendente"
+    if expira_em:
+        try:
+            expira_dt = datetime.fromisoformat(expira_em.replace("Z", "+00:00"))
+            if status_efetivo in ("pendente", "visualizado") and agora > expira_dt:
+                status_efetivo = "expirado"
+        except Exception:
+            pass
+    return status_efetivo
+
+
 def _obter_remetente_publico() -> dict:
     remetente = db.buscar_usuario_por_email(settings.public_sender_email)
     if remetente:
@@ -153,6 +231,7 @@ def _obter_remetente_publico() -> dict:
 
 
 def _serializar_solicitacao_publica(documento: dict, solicitacao: dict) -> dict:
+    flow = _extract_flow_fields(solicitacao)
     return {
         "id": solicitacao["id"],
         "documento_id": documento["id"],
@@ -165,6 +244,11 @@ def _serializar_solicitacao_publica(documento: dict, solicitacao: dict) -> dict:
         "assinatura_obrigatoria_cpf_cnpj": solicitacao.get("assinatura_obrigatoria_cpf_cnpj"),
         "status": solicitacao["status"],
         "expira_em": solicitacao["expira_em"],
+        "mensagem": flow["mensagem_limpa"],
+        "operacao_id": flow["operacao_id"],
+        "bundle_token": flow["bundle_token"],
+        "operacao_total_documentos": flow["operacao_total_documentos"],
+        "operacao_documento_indice": flow["operacao_documento_indice"],
         "link_assinatura": f"{settings.frontend_url}/assinar/{solicitacao['token_acesso']}",
     }
 
@@ -200,6 +284,28 @@ def _obter_solicitacao_gold_credit_pendente(documento_id: str, solicitacao_atual
         if item.get("status") != "assinado":
             return item
     return None
+
+
+def _montar_links_operacao(solicitacoes_serializadas: list[dict]) -> list[dict]:
+    links: list[dict] = []
+    vistos: set[tuple[str, str]] = set()
+    for item in solicitacoes_serializadas:
+        papel = item.get("papel_assinatura") or "cedente"
+        bundle_token = item.get("bundle_token")
+        if not bundle_token or papel == "cessionaria_gold_credit":
+            continue
+        chave = (papel, bundle_token)
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        links.append({
+            "papel_assinatura": papel,
+            "nome": item.get("signatario_nome"),
+            "token": bundle_token,
+            "link": f"{settings.frontend_url}/assinar-operacao/{bundle_token}",
+            "total_documentos": item.get("operacao_total_documentos"),
+        })
+    return links
 
 
 def _garantir_ordem_assinatura(solicitacao: dict):
@@ -293,6 +399,52 @@ def _obter_docs_permitidos_solicitacao(solicitacao: dict) -> tuple[set[str], dic
         if digits:
             docs_permitidos.add(digits)
     return docs_permitidos, cliente, remetente
+
+
+def _criar_solicitacao_signatario_publico(
+    *,
+    documento: dict,
+    signatario_email: str,
+    signatario_nome: str,
+    assinatura_doc: str,
+    mensagem: str | None,
+    assinatura_pagina: int,
+    assinatura_x: float,
+    assinatura_y: float,
+    assinatura_largura: float,
+    assinatura_altura: float,
+    papel: str,
+    bundle_token: str | None,
+    operation_id: str | None,
+    document_index: int,
+    total_documents: int,
+) -> dict:
+    assinatura_tipo = "cliente_cpf" if len(assinatura_doc) == 11 else "cliente_cnpj"
+    if papel == "responsavel_solidario":
+        assinatura_tipo = "responsavel_solidario"
+
+    return db.criar_solicitacao(
+        documento_id=documento["id"],
+        signatario_email=signatario_email,
+        signatario_nome=signatario_nome or signatario_email,
+        mensagem=_build_flow_message(
+            mensagem,
+            operation_id=operation_id,
+            bundle_token=bundle_token,
+            role=papel,
+            document_index=document_index,
+            total_documents=total_documents,
+        ),
+        dias_expiracao=settings.signing_link_expiration_days,
+        assinatura_obrigatoria_tipo=assinatura_tipo,
+        assinatura_obrigatoria_cpf_cnpj=assinatura_doc,
+        assinatura_obrigatoria_nome=signatario_nome or None,
+        assinatura_pagina=assinatura_pagina,
+        assinatura_x=assinatura_x,
+        assinatura_y=assinatura_y,
+        assinatura_largura=assinatura_largura,
+        assinatura_altura=assinatura_altura,
+    )
 
 
 # ============================================================
@@ -1245,7 +1397,9 @@ async def listar_solicitacoes_cliente(cliente: dict = Depends(get_cliente_atual)
 @app.post("/api/assinatura/criar")
 async def criar_solicitacao_publica(
     request: Request,
-    arquivo: UploadFile = File(...),
+    arquivos: list[UploadFile] | None = File(None),
+    arquivo: UploadFile | None = File(None),
+    documentos_json: str = Form(""),
     titulo: str = Form(""),
     tipo_documento: str = Form(""),
     signatario_nome: str = Form(...),
@@ -1273,14 +1427,7 @@ async def criar_solicitacao_publica(
     assinatura_largura_rs: float = Form(0.44),
     assinatura_altura_rs: float = Form(0.12),
 ):
-    """Cria documento e link de assinatura sem depender de login."""
-    if not arquivo.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Apenas arquivos PDF sao aceitos")
-
-    conteudo = await arquivo.read()
-    if len(conteudo) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Arquivo excede 50MB")
-
+    """Cria uma operação pública com um ou vários documentos sem depender de login."""
     signatario_email = (signatario_email or "").strip().lower()
     signatario_nome = (signatario_nome or "").strip()
     assinatura_doc = "".join(c for c in str(signatario_cpf_cnpj or "") if c.isdigit())
@@ -1289,196 +1436,251 @@ async def criar_solicitacao_publica(
     if not signatario_email:
         raise HTTPException(status_code=400, detail="Email do signatario e obrigatorio")
 
-    remetente = _obter_remetente_publico()
-    hash_sha256 = calcular_hash_pdf(conteudo)
-    storage_path = f"documentos/publico/{remetente['id']}/{uuid.uuid4()}/{arquivo.filename}"
-    db.upload_arquivo(storage_path, conteudo)
+    arquivos_recebidos = list(arquivos or [])
+    if arquivo is not None:
+        arquivos_recebidos.insert(0, arquivo)
+    if not arquivos_recebidos:
+        raise HTTPException(status_code=400, detail="Envie pelo menos um arquivo PDF")
 
-    titulo_final = (titulo or tipo_documento or os.path.splitext(arquivo.filename)[0]).strip()
-    documento = db.criar_documento(
-        titulo=titulo_final,
-        nome_arquivo=arquivo.filename,
-        tamanho_bytes=len(conteudo),
-        hash_sha256=hash_sha256,
-        storage_path=storage_path,
-        remetente_id=remetente["id"],
-    )
-    if not documento:
-        raise HTTPException(status_code=500, detail="Nao foi possivel criar o documento")
-
-    # Posições sempre vêm do formulário (drag UI). Para contrato_mae, a página
-    # usa o padrão das configurações se não informada explicitamente.
-    if contrato_mae:
-        pagina = max(1, int(assinatura_pagina or settings.contract_mother_signature_page or 12))
-    else:
-        pagina = max(1, int(assinatura_pagina or 1))
-    pos_x = _clamp_float(assinatura_x or 0.06, 0.0, 0.95)
-    pos_y = _clamp_float(assinatura_y or 0.06, 0.0, 0.95)
-    largura = _clamp_float(assinatura_largura or 0.44, 0.05, 1.0)
-    altura = _clamp_float(assinatura_altura or 0.12, 0.05, 1.0)
-
-    solicitacao = db.criar_solicitacao(
-        documento_id=documento["id"],
-        signatario_email=signatario_email,
-        signatario_nome=signatario_nome or signatario_email,
-        mensagem=(mensagem or "").strip() or None,
-        dias_expiracao=settings.signing_link_expiration_days,
-        assinatura_obrigatoria_tipo="cliente_cpf" if len(assinatura_doc) == 11 else "cliente_cnpj",
-        assinatura_obrigatoria_cpf_cnpj=assinatura_doc,
-        assinatura_obrigatoria_nome=signatario_nome or None,
-        assinatura_pagina=pagina,
-        assinatura_x=pos_x,
-        assinatura_y=pos_y,
-        assinatura_largura=largura,
-        assinatura_altura=altura,
-    )
-    if not solicitacao:
-        raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao de assinatura")
-
-    solicitacoes_criadas = [_serializar_solicitacao_publica(documento, solicitacao)]
-
-    if incluir_assinatura_gold_credit:
-        gold_credit_doc = "".join(c for c in str(settings.gold_credit_signer_document or "") if c.isdigit())
-        if len(gold_credit_doc) != 14:
-            raise HTTPException(status_code=500, detail="Configuracao da Gold Credit invalida")
-
-        gc_pagina = max(1, int(assinatura_pagina_gc or settings.gold_credit_signature_page or 12))
-        gc_x = _clamp_float(assinatura_x_gc or settings.gold_credit_signature_x, 0.0, 0.95)
-        gc_y = _clamp_float(assinatura_y_gc or settings.gold_credit_signature_y, 0.0, 0.95)
-        gc_largura = _clamp_float(assinatura_largura_gc or settings.gold_credit_signature_width, 0.05, 1.0)
-        gc_altura = _clamp_float(assinatura_altura_gc or settings.gold_credit_signature_height, 0.05, 1.0)
-
-        solicitacao_gold_credit = db.criar_solicitacao(
-            documento_id=documento["id"],
-            signatario_email=(settings.gold_credit_signer_email or settings.public_sender_email).strip().lower(),
-            signatario_nome=settings.gold_credit_signer_name,
-            mensagem="Assinatura da cessionaria Gold Credit",
-            dias_expiracao=settings.signing_link_expiration_days,
-            assinatura_obrigatoria_tipo="cliente_cnpj",
-            assinatura_obrigatoria_cpf_cnpj=gold_credit_doc,
-            assinatura_obrigatoria_nome=settings.gold_credit_signer_name,
-            assinatura_pagina=gc_pagina,
-            assinatura_x=gc_x,
-            assinatura_y=gc_y,
-            assinatura_largura=gc_largura,
-            assinatura_altura=gc_altura,
-        )
-        if not solicitacao_gold_credit:
-            raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao da Gold Credit")
-
-        # Assinatura automatica obrigatoria: a cessionaria Gold Credit somos nos.
-        # Se o certificado nao estiver configurado ou a assinatura falhar, retorna erro.
-        if not settings.gold_credit_pkcs12_b64:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Certificado da cessionaria Gold Credit nao configurado no servidor. "
-                    "Adicione GOLD_CREDIT_PKCS12_B64 e GOLD_CREDIT_PKCS12_PASSWORD no .env."
-                ),
-            )
-
+    documentos_payload: list[dict] = []
+    if documentos_json.strip():
         try:
-            pkcs12_b64_clean = "".join(settings.gold_credit_pkcs12_b64.split())
-            pkcs12_bytes = base64.b64decode(pkcs12_b64_clean)
-            pkcs12_password = (settings.gold_credit_pkcs12_password or "").encode()
-            gc_field_name = _field_name_solicitacao(solicitacao_gold_credit["id"])
+            parsed = json.loads(documentos_json)
+            if not isinstance(parsed, list):
+                raise ValueError
+            documentos_payload = [item if isinstance(item, dict) else {} for item in parsed]
+        except Exception:
+            raise HTTPException(status_code=400, detail="documentos_json invalido")
+    if documentos_payload and len(documentos_payload) != len(arquivos_recebidos):
+        raise HTTPException(status_code=400, detail="A quantidade de metadados nao corresponde aos arquivos enviados")
 
-            pdf_assinado_gc, cert_pem_gc = await asyncio.to_thread(
-                assinar_pdf_servidor,
-                conteudo,
-                gc_field_name,
-                gc_pagina,
-                gc_x,
-                gc_y,
-                gc_largura,
-                gc_altura,
-                pkcs12_bytes,
-                pkcs12_password,
-            )
-
-            storage_path_assinado_gc = documento["storage_path"].replace(".pdf", "_assinado.pdf")
-            db.upload_arquivo(storage_path_assinado_gc, pdf_assinado_gc)
-
-            info_cert_gc = extrair_info_certificado(cert_pem_gc)
-            agora_gc = datetime.now(timezone.utc).isoformat()
-
-            db.criar_assinatura({
-                "solicitacao_id": solicitacao_gold_credit["id"],
-                "documento_id": documento["id"],
-                "cert_subject_cn": info_cert_gc.get("subject_cn"),
-                "cert_subject_cpf": info_cert_gc.get("cpf"),
-                "cert_issuer_cn": info_cert_gc.get("issuer_cn"),
-                "cert_serial_number": info_cert_gc.get("serial_number"),
-                "cert_not_before": info_cert_gc.get("not_before"),
-                "cert_not_after": info_cert_gc.get("not_after"),
-                "cert_tipo": "A1",
-                "cert_pem": cert_pem_gc,
-                "hash_conteudo_assinado": calcular_hash_pdf(conteudo),
-                "algoritmo_assinatura": "SHA256withRSA",
-                "ip_signatario": get_client_ip(request),
-                "user_agent": request.headers.get("user-agent"),
-            })
-
-            db.atualizar_solicitacao(solicitacao_gold_credit["id"], {"status": "assinado", "assinado_em": agora_gc})
-            db.atualizar_documento(documento["id"], {"storage_path_assinado": storage_path_assinado_gc})
-            db.recalcular_status_documento(documento["id"])
-
-            solicitacao_gold_credit = {**solicitacao_gold_credit, "status": "assinado"}
-        except HTTPException:
-            raise
-        except Exception as exc_gc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Falha ao aplicar assinatura automatica da cessionaria Gold Credit: {exc_gc}",
-            )
-
-        solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_gold_credit))
-
-    # Responsavel solidario (opcional)
+    remetente = _obter_remetente_publico()
+    operation_id = str(uuid.uuid4())
+    total_documents = len(arquivos_recebidos)
+    bundle_token_cedente = str(uuid.uuid4())
     rs_doc = "".join(c for c in str(responsavel_solidario_cpf_cnpj or "") if c.isdigit())
     rs_email = (responsavel_solidario_email or "").strip().lower()
-    if rs_doc and len(rs_doc) in (11, 14) and rs_email:
-        pagina_rs = max(1, int(assinatura_pagina_rs or assinatura_pagina or 1))
-        solicitacao_rs = db.criar_solicitacao(
-            documento_id=documento["id"],
-            signatario_email=rs_email,
-            signatario_nome=(responsavel_solidario_nome or rs_email).strip(),
-            mensagem=(mensagem or "").strip() or None,
-            dias_expiracao=settings.signing_link_expiration_days,
-            assinatura_obrigatoria_tipo="responsavel_solidario",
-            assinatura_obrigatoria_cpf_cnpj=rs_doc,
-            assinatura_obrigatoria_nome=(responsavel_solidario_nome or None),
-            assinatura_pagina=pagina_rs,
-            assinatura_x=_clamp_float(assinatura_x_rs or 0.52, 0.0, 0.95),
-            assinatura_y=_clamp_float(assinatura_y_rs or 0.08, 0.0, 0.95),
-            assinatura_largura=_clamp_float(assinatura_largura_rs or 0.44, 0.05, 1.0),
-            assinatura_altura=_clamp_float(assinatura_altura_rs or 0.12, 0.05, 1.0),
+    tem_responsavel = bool(rs_doc and len(rs_doc) in (11, 14) and rs_email)
+    bundle_token_responsavel = str(uuid.uuid4()) if tem_responsavel else None
+    solicitacoes_criadas: list[dict] = []
+
+    if incluir_assinatura_gold_credit and not settings.gold_credit_pkcs12_b64:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Certificado da cessionaria Gold Credit nao configurado no servidor. "
+                "Adicione GOLD_CREDIT_PKCS12_B64 e GOLD_CREDIT_PKCS12_PASSWORD no .env."
+            ),
         )
-        if solicitacao_rs:
-            solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_rs))
 
-    db.recalcular_status_documento(documento["id"])
+    gold_credit_doc = "".join(c for c in str(settings.gold_credit_signer_document or "") if c.isdigit())
+    if incluir_assinatura_gold_credit and len(gold_credit_doc) != 14:
+        raise HTTPException(status_code=500, detail="Configuracao da Gold Credit invalida")
 
-    db.registrar_auditoria(
-        tipo_evento="SOLICITACAO_PUBLICA_CRIADA",
-        descricao=f"Solicitacao publica criada para {signatario_email}",
-        documento_id=documento["id"],
-        solicitacao_id=solicitacao["id"],
-        usuario_id=remetente["id"],
-        ip_origem=get_client_ip(request),
-        user_agent=request.headers.get("user-agent"),
-        dados_extras={
-            "signatario_nome": signatario_nome,
-            "signatario_email": signatario_email,
-            "signatario_cpf_cnpj": assinatura_doc,
-            "contrato_mae": contrato_mae,
-            "incluir_assinatura_gold_credit": incluir_assinatura_gold_credit,
-        },
-    )
+    for index, arquivo_atual in enumerate(arquivos_recebidos, start=1):
+        if not arquivo_atual.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Apenas arquivos PDF sao aceitos")
 
+        conteudo = await arquivo_atual.read()
+        if len(conteudo) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"Arquivo {arquivo_atual.filename} excede 50MB")
+
+        meta = documentos_payload[index - 1] if documentos_payload else {}
+        tipo_documento_item = str(meta.get("tipo_documento") or tipo_documento or "").strip()
+        titulo_item = str(meta.get("titulo") or titulo or tipo_documento_item or os.path.splitext(arquivo_atual.filename)[0]).strip()
+        mensagem_item = (meta.get("mensagem") or mensagem or "").strip() or None
+        is_contrato_mae = bool(meta.get("contrato_mae")) if documentos_payload else bool(contrato_mae)
+
+        assinatura_pagina_item = int(meta.get("assinatura_pagina_cedente", assinatura_pagina))
+        assinatura_x_item = float(meta.get("assinatura_x_cedente", assinatura_x))
+        assinatura_y_item = float(meta.get("assinatura_y_cedente", assinatura_y))
+        assinatura_largura_item = float(meta.get("assinatura_largura_cedente", assinatura_largura))
+        assinatura_altura_item = float(meta.get("assinatura_altura_cedente", assinatura_altura))
+        assinatura_pagina_gc_item = int(meta.get("assinatura_pagina_gc", assinatura_pagina_gc))
+        assinatura_x_gc_item = float(meta.get("assinatura_x_gc", assinatura_x_gc))
+        assinatura_y_gc_item = float(meta.get("assinatura_y_gc", assinatura_y_gc))
+        assinatura_largura_gc_item = float(meta.get("assinatura_largura_gc", assinatura_largura_gc))
+        assinatura_altura_gc_item = float(meta.get("assinatura_altura_gc", assinatura_altura_gc))
+        assinatura_pagina_rs_item = int(meta.get("assinatura_pagina_rs", assinatura_pagina_rs))
+        assinatura_x_rs_item = float(meta.get("assinatura_x_rs", assinatura_x_rs))
+        assinatura_y_rs_item = float(meta.get("assinatura_y_rs", assinatura_y_rs))
+        assinatura_largura_rs_item = float(meta.get("assinatura_largura_rs", assinatura_largura_rs))
+        assinatura_altura_rs_item = float(meta.get("assinatura_altura_rs", assinatura_altura_rs))
+
+        hash_sha256 = calcular_hash_pdf(conteudo)
+        storage_path = f"documentos/publico/{remetente['id']}/{operation_id}/{uuid.uuid4()}_{arquivo_atual.filename}"
+        db.upload_arquivo(storage_path, conteudo)
+
+        documento = db.criar_documento(
+            titulo=titulo_item,
+            nome_arquivo=arquivo_atual.filename,
+            tamanho_bytes=len(conteudo),
+            hash_sha256=hash_sha256,
+            storage_path=storage_path,
+            remetente_id=remetente["id"],
+        )
+        if not documento:
+            raise HTTPException(status_code=500, detail="Nao foi possivel criar o documento")
+
+        pagina = max(1, int(assinatura_pagina_item or (settings.contract_mother_signature_page or 12 if is_contrato_mae else 1)))
+        pos_x = _clamp_float(assinatura_x_item or 0.06, 0.0, 0.95)
+        pos_y = _clamp_float(assinatura_y_item or 0.06, 0.0, 0.95)
+        largura = _clamp_float(assinatura_largura_item or 0.44, 0.05, 1.0)
+        altura = _clamp_float(assinatura_altura_item or 0.12, 0.05, 1.0)
+
+        solicitacao = _criar_solicitacao_signatario_publico(
+            documento=documento,
+            signatario_email=signatario_email,
+            signatario_nome=signatario_nome or signatario_email,
+            assinatura_doc=assinatura_doc,
+            mensagem=mensagem_item,
+            assinatura_pagina=pagina,
+            assinatura_x=pos_x,
+            assinatura_y=pos_y,
+            assinatura_largura=largura,
+            assinatura_altura=altura,
+            papel="cedente",
+            bundle_token=bundle_token_cedente,
+            operation_id=operation_id,
+            document_index=index,
+            total_documents=total_documents,
+        )
+        if not solicitacao:
+            raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao de assinatura")
+        solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao))
+
+        if incluir_assinatura_gold_credit:
+            gc_pagina = max(1, int(assinatura_pagina_gc_item or settings.gold_credit_signature_page or 12))
+            gc_x = _clamp_float(assinatura_x_gc_item or settings.gold_credit_signature_x, 0.0, 0.95)
+            gc_y = _clamp_float(assinatura_y_gc_item or settings.gold_credit_signature_y, 0.0, 0.95)
+            gc_largura = _clamp_float(assinatura_largura_gc_item or settings.gold_credit_signature_width, 0.05, 1.0)
+            gc_altura = _clamp_float(assinatura_altura_gc_item or settings.gold_credit_signature_height, 0.05, 1.0)
+
+            solicitacao_gold_credit = _criar_solicitacao_signatario_publico(
+                documento=documento,
+                signatario_email=(settings.gold_credit_signer_email or settings.public_sender_email).strip().lower(),
+                signatario_nome=settings.gold_credit_signer_name,
+                assinatura_doc=gold_credit_doc,
+                mensagem="Assinatura da cessionaria Gold Credit",
+                assinatura_pagina=gc_pagina,
+                assinatura_x=gc_x,
+                assinatura_y=gc_y,
+                assinatura_largura=gc_largura,
+                assinatura_altura=gc_altura,
+                papel="cessionaria_gold_credit",
+                bundle_token=None,
+                operation_id=operation_id,
+                document_index=index,
+                total_documents=total_documents,
+            )
+            if not solicitacao_gold_credit:
+                raise HTTPException(status_code=500, detail="Nao foi possivel criar a solicitacao da Gold Credit")
+
+            try:
+                pkcs12_b64_clean = "".join(settings.gold_credit_pkcs12_b64.split())
+                pkcs12_bytes = base64.b64decode(pkcs12_b64_clean)
+                pkcs12_password = (settings.gold_credit_pkcs12_password or "").encode()
+                gc_field_name = _field_name_solicitacao(solicitacao_gold_credit["id"])
+
+                pdf_assinado_gc, cert_pem_gc = await asyncio.to_thread(
+                    assinar_pdf_servidor,
+                    conteudo,
+                    gc_field_name,
+                    gc_pagina,
+                    gc_x,
+                    gc_y,
+                    gc_largura,
+                    gc_altura,
+                    pkcs12_bytes,
+                    pkcs12_password,
+                )
+
+                storage_path_assinado_gc = documento["storage_path"].replace(".pdf", "_assinado.pdf")
+                db.upload_arquivo(storage_path_assinado_gc, pdf_assinado_gc)
+
+                info_cert_gc = extrair_info_certificado(cert_pem_gc)
+                agora_gc = datetime.now(timezone.utc).isoformat()
+
+                db.criar_assinatura({
+                    "solicitacao_id": solicitacao_gold_credit["id"],
+                    "documento_id": documento["id"],
+                    "cert_subject_cn": info_cert_gc.get("subject_cn"),
+                    "cert_subject_cpf": info_cert_gc.get("cpf"),
+                    "cert_issuer_cn": info_cert_gc.get("issuer_cn"),
+                    "cert_serial_number": info_cert_gc.get("serial_number"),
+                    "cert_not_before": info_cert_gc.get("not_before"),
+                    "cert_not_after": info_cert_gc.get("not_after"),
+                    "cert_tipo": "A1",
+                    "cert_pem": cert_pem_gc,
+                    "hash_conteudo_assinado": calcular_hash_pdf(conteudo),
+                    "algoritmo_assinatura": "SHA256withRSA",
+                    "ip_signatario": get_client_ip(request),
+                    "user_agent": request.headers.get("user-agent"),
+                })
+
+                db.atualizar_solicitacao(solicitacao_gold_credit["id"], {"status": "assinado", "assinado_em": agora_gc})
+                db.atualizar_documento(documento["id"], {"storage_path_assinado": storage_path_assinado_gc})
+                db.recalcular_status_documento(documento["id"])
+                solicitacao_gold_credit = {**solicitacao_gold_credit, "status": "assinado"}
+            except HTTPException:
+                raise
+            except Exception as exc_gc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Falha ao aplicar assinatura automatica da cessionaria Gold Credit: {exc_gc}",
+                )
+
+            solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_gold_credit))
+
+        if tem_responsavel and bundle_token_responsavel:
+            pagina_rs = max(1, int(assinatura_pagina_rs_item or assinatura_pagina_item or 1))
+            solicitacao_rs = _criar_solicitacao_signatario_publico(
+                documento=documento,
+                signatario_email=rs_email,
+                signatario_nome=(responsavel_solidario_nome or rs_email).strip(),
+                assinatura_doc=rs_doc,
+                mensagem=mensagem_item,
+                assinatura_pagina=pagina_rs,
+                assinatura_x=_clamp_float(assinatura_x_rs_item or 0.52, 0.0, 0.95),
+                assinatura_y=_clamp_float(assinatura_y_rs_item or 0.08, 0.0, 0.95),
+                assinatura_largura=_clamp_float(assinatura_largura_rs_item or 0.44, 0.05, 1.0),
+                assinatura_altura=_clamp_float(assinatura_altura_rs_item or 0.12, 0.05, 1.0),
+                papel="responsavel_solidario",
+                bundle_token=bundle_token_responsavel,
+                operation_id=operation_id,
+                document_index=index,
+                total_documents=total_documents,
+            )
+            if solicitacao_rs:
+                solicitacoes_criadas.append(_serializar_solicitacao_publica(documento, solicitacao_rs))
+
+        db.recalcular_status_documento(documento["id"])
+        db.registrar_auditoria(
+            tipo_evento="SOLICITACAO_PUBLICA_CRIADA",
+            descricao=f"Solicitacao publica criada para {signatario_email}",
+            documento_id=documento["id"],
+            solicitacao_id=solicitacao["id"],
+            usuario_id=remetente["id"],
+            ip_origem=get_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            dados_extras={
+                "signatario_nome": signatario_nome,
+                "signatario_email": signatario_email,
+                "signatario_cpf_cnpj": assinatura_doc,
+                "tipo_documento": tipo_documento_item,
+                "operation_id": operation_id,
+                "document_index": index,
+                "documents_total": total_documents,
+            },
+        )
+
+    links_operacao = _montar_links_operacao(solicitacoes_criadas)
     return {
         **solicitacoes_criadas[0],
         "solicitacoes": solicitacoes_criadas,
+        "operacao_id": operation_id,
+        "links_operacao": links_operacao,
+        "total_documentos": total_documents,
     }
 
 
@@ -1500,17 +1702,10 @@ async def listar_solicitacoes_publicas(limit: int = 50):
 
     for sol in solicitacoes:
         expira_em = sol.get("expira_em")
-        status_efetivo = sol.get("status") or "pendente"
-        if expira_em:
-            try:
-                expira_dt = datetime.fromisoformat(expira_em.replace("Z", "+00:00"))
-                if status_efetivo in ("pendente", "visualizado") and agora > expira_dt:
-                    status_efetivo = "expirado"
-            except Exception:
-                pass
-
+        status_efetivo = _status_efetivo_solicitacao(sol, agora=agora)
         doc = sol.get("documentos", {}) or {}
         token = sol.get("token_acesso")
+        flow = _extract_flow_fields(sol)
         resultado.append({
             "id": sol["id"],
             "documento_id": sol.get("documento_id"),
@@ -1520,14 +1715,19 @@ async def listar_solicitacoes_publicas(limit: int = 50):
             "signatario_nome": sol.get("signatario_nome"),
             "signatario_email": sol.get("signatario_email"),
             "assinatura_obrigatoria_cpf_cnpj": sol.get("assinatura_obrigatoria_cpf_cnpj"),
-            "mensagem": sol.get("mensagem"),
+            "mensagem": flow["mensagem_limpa"],
             "status": status_efetivo,
             "criado_em": sol.get("criado_em"),
             "assinado_em": sol.get("assinado_em"),
             "expira_em": expira_em,
             "token_acesso": token,
+            "operacao_id": flow["operacao_id"],
+            "bundle_token": flow["bundle_token"],
+            "operacao_total_documentos": flow["operacao_total_documentos"],
+            "operacao_documento_indice": flow["operacao_documento_indice"],
             "tem_assinado": bool(doc.get("storage_path_assinado")),
             "link_assinatura": f"{settings.frontend_url}/assinar/{token}" if token else None,
+            "link_operacao": f"{settings.frontend_url}/assinar-operacao/{flow['bundle_token']}" if flow["bundle_token"] else None,
         })
 
     return resultado
@@ -1536,6 +1736,54 @@ async def listar_solicitacoes_publicas(limit: int = 50):
 # ============================================================
 # ENDPOINTS PÃšBLICOS (ACESSO VIA TOKEN DE ASSINATURA)
 # ============================================================
+
+@app.get("/api/assinatura/operacao/{bundle_token}")
+async def obter_operacao_publica(bundle_token: str):
+    """Retorna todos os documentos de uma operação para um mesmo signatário."""
+    solicitacoes = db.listar_solicitacoes_por_bundle_token(bundle_token, limit=500)
+    if not solicitacoes:
+        raise HTTPException(status_code=404, detail="Operacao nao encontrada")
+
+    agora = datetime.now(timezone.utc)
+    documentos = []
+    primeira = solicitacoes[0]
+    primeira_flow = _extract_flow_fields(primeira)
+
+    for sol in solicitacoes:
+        flow = _extract_flow_fields(sol)
+        if flow.get("bundle_token") != bundle_token:
+            continue
+        doc = sol.get("documentos", {}) or {}
+        documentos.append({
+            "solicitacao_id": sol["id"],
+            "documento_id": sol.get("documento_id"),
+            "token_acesso": sol.get("token_acesso"),
+            "titulo": doc.get("titulo", ""),
+            "nome_arquivo": doc.get("nome_arquivo", ""),
+            "status": _status_efetivo_solicitacao(sol, agora=agora),
+            "mensagem": flow["mensagem_limpa"],
+            "papel_assinatura": _papel_solicitacao(sol),
+            "operacao_documento_indice": flow["operacao_documento_indice"],
+            "tem_assinado": bool(doc.get("storage_path_assinado")),
+        })
+
+    documentos.sort(key=lambda item: (item.get("operacao_documento_indice") or 0, item.get("titulo") or ""))
+    total_assinados = sum(1 for item in documentos if item["status"] == "assinado")
+    total_pendentes = sum(1 for item in documentos if item["status"] in ("pendente", "visualizado"))
+
+    return {
+        "bundle_token": bundle_token,
+        "operacao_id": primeira_flow["operacao_id"],
+        "papel_assinatura": primeira_flow["bundle_role"] or _papel_solicitacao(primeira),
+        "signatario_nome": primeira.get("signatario_nome"),
+        "signatario_email": primeira.get("signatario_email"),
+        "signatario_cpf_cnpj": primeira.get("assinatura_obrigatoria_cpf_cnpj"),
+        "total_documentos": len(documentos),
+        "total_assinados": total_assinados,
+        "total_pendentes": total_pendentes,
+        "documentos": documentos,
+    }
+
 
 @app.get("/api/assinatura/{token}")
 async def obter_solicitacao_por_token(token: str, request: Request):
@@ -1570,15 +1818,20 @@ async def obter_solicitacao_por_token(token: str, request: Request):
         )
 
     doc = solicitacao.get("documentos", {})
+    flow = _extract_flow_fields(solicitacao)
     return {
         "solicitacao_id": solicitacao["id"],
         "documento_id": solicitacao["documento_id"],
         "titulo": doc.get("titulo", ""),
         "nome_arquivo": doc.get("nome_arquivo", ""),
+        "operacao_id": flow["operacao_id"],
+        "bundle_token": flow["bundle_token"],
+        "operacao_total_documentos": flow["operacao_total_documentos"],
+        "operacao_documento_indice": flow["operacao_documento_indice"],
         "papel_assinatura": _papel_solicitacao(solicitacao),
         "signatario_nome": solicitacao.get("signatario_nome"),
         "signatario_email": solicitacao.get("signatario_email"),
-        "mensagem": solicitacao.get("mensagem"),
+        "mensagem": flow["mensagem_limpa"],
         "assinatura_obrigatoria_tipo": solicitacao.get("assinatura_obrigatoria_tipo"),
         "assinatura_obrigatoria_cpf_cnpj": solicitacao.get("assinatura_obrigatoria_cpf_cnpj"),
         "assinatura_obrigatoria_nome": solicitacao.get("assinatura_obrigatoria_nome"),
